@@ -2586,34 +2586,94 @@ func buildWhereFuncDepend(p LogicalPlan, where ast.ExprNode) map[*types.FieldNam
 func buildJoinFuncDepend(p LogicalPlan, from ast.ResultSetNode) map[*types.FieldName]*types.FieldName {
 	switch x := from.(type) {
 	case *ast.Join:
-		if x.On == nil {
-			return nil
+		if x.On != nil {
+			onConditions := splitWhere(x.On.Expr)
+			colDependMap := make(map[*types.FieldName]*types.FieldName, len(onConditions))
+			for _, cond := range onConditions {
+				lCol, rCol := buildFuncDependCol(p, cond)
+				if lCol == nil || rCol == nil {
+					continue
+				}
+				lTbl := tblInfoFromCol(x.Left, lCol)
+				if lTbl == nil {
+					lCol, rCol = rCol, lCol
+				}
+				switch x.Tp {
+				case ast.CrossJoin:
+					colDependMap[lCol] = rCol
+					colDependMap[rCol] = lCol
+				case ast.LeftJoin:
+					colDependMap[rCol] = lCol
+				case ast.RightJoin:
+					colDependMap[lCol] = rCol
+				}
+			}
+			return colDependMap
 		}
-		onConditions := splitWhere(x.On.Expr)
-		colDependMap := make(map[*types.FieldName]*types.FieldName, len(onConditions))
-		for _, cond := range onConditions {
-			lCol, rCol := buildFuncDependCol(p, cond)
-			if lCol == nil || rCol == nil {
-				continue
+		if len(x.Using) > 0 {
+			colDependMap := make(map[*types.FieldName]*types.FieldName, len(x.Using))
+			for _, col := range x.Using {
+				getFieldName := func(colName *ast.ColumnName, from ast.ResultSetNode) *types.FieldName {
+					var tableList []*ast.TableName
+					tableList = extractTableList(from, tableList, true)
+					for _, tableName := range tableList {
+						for _, colInfo := range tableName.TableInfo.Columns {
+							if colInfo.Name.L == col.Name.L {
+								return &types.FieldName{
+									OrigTblName: tableName.Name,
+									OrigColName: col.Name,
+									DBName: tableName.DBInfo.Name,
+									TblName: tableName.Name,
+									ColName: col.Name,
+								}
+							}
+						}
+					}
+					return nil
+				}
+				lCol := getFieldName(col, x.Left)
+				if lCol == nil {
+					continue
+				}
+				rCol := getFieldName(col, x.Right)
+				if rCol == nil {
+					continue
+				}
+				switch x.Tp {
+				case ast.CrossJoin:
+					colDependMap[lCol] = rCol
+					colDependMap[rCol] = lCol
+				case ast.LeftJoin:
+					colDependMap[rCol] = lCol
+				case ast.RightJoin:
+					colDependMap[lCol] = rCol
+				}
 			}
-			lTbl := tblInfoFromCol(x.Left, lCol)
-			if lTbl == nil {
-				lCol, rCol = rCol, lCol
-			}
-			switch x.Tp {
-			case ast.CrossJoin:
-				colDependMap[lCol] = rCol
-				colDependMap[rCol] = lCol
-			case ast.LeftJoin:
-				colDependMap[rCol] = lCol
-			case ast.RightJoin:
-				colDependMap[lCol] = rCol
-			}
+			return colDependMap
 		}
-		return colDependMap
-	default:
-		return nil
 	}
+	return nil
+}
+
+func dependOnGbyOrSingleValue(
+	name *types.FieldName,
+	gbyOrSingleValueColNames map[*types.FieldName]struct{},
+	whereDependNames, joinDependNames map[*types.FieldName]*types.FieldName,
+) bool {
+	if _, ok := gbyOrSingleValueColNames[name]; ok {
+		return true
+	}
+	if wCol, ok := whereDependNames[name]; ok {
+		if dependOnGbyOrSingleValue(wCol, gbyOrSingleValueColNames, whereDependNames, joinDependNames) {
+			return true
+		}
+	}
+	if jCol, ok := joinDependNames[name]; ok {
+		if dependOnGbyOrSingleValue(jCol, gbyOrSingleValueColNames, whereDependNames, joinDependNames) {
+			return true
+		}
+	}
+	return false
 }
 
 func checkColFuncDepend(
@@ -2623,6 +2683,9 @@ func checkColFuncDepend(
 	gbyOrSingleValueColNames map[*types.FieldName]struct{},
 	whereDependNames, joinDependNames map[*types.FieldName]*types.FieldName,
 ) bool {
+	if dependOnGbyOrSingleValue(name, gbyOrSingleValueColNames, whereDependNames, joinDependNames) {
+		return true
+	}
 	for _, index := range tblInfo.Indices {
 		if !index.Unique {
 			continue
@@ -2645,21 +2708,10 @@ func checkColFuncDepend(
 				break
 			}
 			iName := p.OutputNames()[iIdx]
-			if _, ok := gbyOrSingleValueColNames[iName]; ok {
-				continue
+			if !dependOnGbyOrSingleValue(iName, gbyOrSingleValueColNames, whereDependNames, joinDependNames) {
+				funcDepend = false
+				break
 			}
-			if wCol, ok := whereDependNames[iName]; ok {
-				if _, ok = gbyOrSingleValueColNames[wCol]; ok {
-					continue
-				}
-			}
-			if jCol, ok := joinDependNames[iName]; ok {
-				if _, ok = gbyOrSingleValueColNames[jCol]; ok {
-					continue
-				}
-			}
-			funcDepend = false
-			break
 		}
 		if funcDepend {
 			return true
@@ -2683,21 +2735,10 @@ func checkColFuncDepend(
 			break
 		}
 		pCol := p.OutputNames()[pIdx]
-		if _, ok := gbyOrSingleValueColNames[pCol]; ok {
-			continue
+		if !dependOnGbyOrSingleValue(pCol, gbyOrSingleValueColNames, whereDependNames, joinDependNames) {
+			primaryFuncDepend = false
+			break
 		}
-		if wCol, ok := whereDependNames[pCol]; ok {
-			if _, ok = gbyOrSingleValueColNames[wCol]; ok {
-				continue
-			}
-		}
-		if jCol, ok := joinDependNames[pCol]; ok {
-			if _, ok = gbyOrSingleValueColNames[jCol]; ok {
-				continue
-			}
-		}
-		primaryFuncDepend = false
-		break
 	}
 	return primaryFuncDepend && hasPrimaryField
 }
