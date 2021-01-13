@@ -1167,7 +1167,7 @@ func (b *PlanBuilder) preprocessUserVarTypes(ctx context.Context, p LogicalPlan,
 // underlying join.
 func findColFromNaturalUsingJoin(p LogicalPlan, col *expression.Column) (name *types.FieldName) {
 	switch x := p.(type) {
-	case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow:
+	case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow, *LogicalAggregation:
 		return findColFromNaturalUsingJoin(p.Children()[0], col)
 	case *LogicalJoin:
 		if x.redundantSchema != nil {
@@ -1921,7 +1921,7 @@ func (a *havingWindowAndOrderbyExprResolver) resolveFromPlan(v *ast.ColumnNameEx
 		// schema of selection will be `[t1.a]`, thus we need to recursively
 		// retrieve the `t2.a` from the underlying join.
 		switch x := p.(type) {
-		case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow:
+		case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow, *LogicalAggregation:
 			return a.resolveFromPlan(v, p.Children()[0])
 		case *LogicalJoin:
 			if len(x.redundantNames) != 0 {
@@ -2613,30 +2613,19 @@ func buildJoinFuncDepend(p LogicalPlan, from ast.ResultSetNode) map[*types.Field
 		if len(x.Using) > 0 {
 			colDependMap := make(map[*types.FieldName]*types.FieldName, len(x.Using))
 			for _, col := range x.Using {
-				getFieldName := func(colName *ast.ColumnName, from ast.ResultSetNode) *types.FieldName {
-					var tableList []*ast.TableName
-					tableList = extractTableList(from, tableList, true)
-					for _, tableName := range tableList {
-						for _, colInfo := range tableName.TableInfo.Columns {
-							if colInfo.Name.L == col.Name.L {
-								return &types.FieldName{
-									OrigTblName: tableName.Name,
-									OrigColName: col.Name,
-									DBName: tableName.DBInfo.Name,
-									TblName: tableName.Name,
-									ColName: col.Name,
-								}
-							}
-						}
-					}
-					return nil
-				}
-				lCol := getFieldName(col, x.Left)
-				if lCol == nil {
+				var lCol, rCol *types.FieldName
+				lIdx, err := expression.FindFieldName(p.OutputNames(), col)
+				if err != nil || lIdx == -1 {
 					continue
 				}
-				rCol := getFieldName(col, x.Right)
-				if rCol == nil {
+				lCol = p.OutputNames()[lIdx]
+				if join, ok := p.(*LogicalJoin); ok {
+					rIdx, err := expression.FindFieldName(join.redundantNames, col)
+					if err != nil || rIdx == -1 {
+						continue
+					}
+					rCol = join.redundantNames[rIdx]
+				} else {
 					continue
 				}
 				switch x.Tp {

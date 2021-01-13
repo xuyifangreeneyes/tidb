@@ -1763,7 +1763,7 @@ func (er *expressionRewriter) toColumn(v *ast.ColumnName) {
 
 func findFieldNameFromNaturalUsingJoin(p LogicalPlan, v *ast.ColumnName) (col *expression.Column, name *types.FieldName, err error) {
 	switch x := p.(type) {
-	case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow:
+	case *LogicalLimit, *LogicalSelection, *LogicalTopN, *LogicalSort, *LogicalMaxOneRow, *LogicalAggregation:
 		return findFieldNameFromNaturalUsingJoin(p.Children()[0], v)
 	case *LogicalJoin:
 		if x.redundantSchema != nil {
