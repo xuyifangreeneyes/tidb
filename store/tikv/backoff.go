@@ -245,6 +245,9 @@ const (
 	pessimisticRollbackMaxBackoff  = 20000
 )
 
+// If the number of TiFlash retries exceeds the limit, regard TiFlash as down and fallback to TiKV.
+const RetryLimitOnTiFlash = 2
+
 var (
 	// CommitMaxBackoff is max sleep time of the 'commit' command
 	CommitMaxBackoff = uint64(41000)

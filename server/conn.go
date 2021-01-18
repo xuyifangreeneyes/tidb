@@ -72,6 +72,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/arena"
 	"github.com/pingcap/tidb/util/chunk"
@@ -1586,7 +1587,21 @@ func (cc *clientConn) handleStmt(ctx context.Context, stmt ast.StmtNode, warns [
 
 		err = cc.writeResultset(ctx, rs, false, status, 0)
 		if err != nil {
-			return err
+			if terror.ErrorEqual(err, tikv.ErrTiFlashServerTimeout) {
+				// When the TiFlash server seems down, we append a warning to remind the user to check the status of the TiFlash
+				// server and fallback to TiKV.
+				sessVars := cc.ctx.GetSessionVars()
+				sessVars.StmtCtx.AppendError(err)
+				if _, isolationReadContainTiFlash := sessVars.IsolationReadEngines[kv.TiFlash]; isolationReadContainTiFlash {
+					delete(sessVars.IsolationReadEngines, kv.TiFlash)
+					defer func() {
+						sessVars.IsolationReadEngines[kv.TiFlash] = struct{}{}
+					}()
+				}
+				return cc.handleStmt(ctx, stmt, nil, lastStmt)
+			} else {
+				return err
+			}
 		}
 	} else {
 		handled, err := cc.handleQuerySpecial(ctx, status)

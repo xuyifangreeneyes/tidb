@@ -557,6 +557,9 @@ func (s *RegionRequestSender) onSendFail(bo *Backoffer, ctx *RPCContext, err err
 	// TODO: the number of retry time should be limited:since region may be unavailable
 	// when some unrecoverable disaster happened.
 	if ctx.Store != nil && ctx.Store.storeType == kv.TiFlash {
+		if bo.backoffTimes[boTiFlashRPC] >= RetryLimitOnTiFlash {
+			return errors.Trace(ErrTiFlashServerTimeout)
+		}
 		err = bo.Backoff(boTiFlashRPC, errors.Errorf("send tiflash request error: %v, ctx: %v, try next peer later", err, ctx))
 	} else {
 		err = bo.Backoff(boTiKVRPC, errors.Errorf("send tikv request error: %v, ctx: %v, try next peer later", err, ctx))
