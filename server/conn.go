@@ -1599,9 +1599,8 @@ func (cc *clientConn) handleStmt(ctx context.Context, stmt ast.StmtNode, warns [
 					}()
 				}
 				return cc.handleStmt(ctx, stmt, nil, lastStmt)
-			} else {
-				return err
 			}
+			return err
 		}
 	} else {
 		handled, err := cc.handleQuerySpecial(ctx, status)

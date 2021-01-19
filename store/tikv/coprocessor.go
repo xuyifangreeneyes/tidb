@@ -1079,7 +1079,7 @@ func (worker *copIteratorWorker) handleCopStreamResult(bo *Backoffer, rpcCtx *RP
 			boRPCType := boTiKVRPC
 			if task.storeType == kv.TiFlash {
 				boRPCType = boTiFlashRPC
-				if bo.backoffTimes[boTiFlashRPC] >= RetryLimitOnTiFlash {
+				if bo.backoffTimes[boTiFlashRPC] >= retryLimitOnTiFlash {
 					return nil, errors.Trace(ErrTiFlashServerTimeout)
 				}
 			}

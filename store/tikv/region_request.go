@@ -422,6 +422,14 @@ func (s *RegionRequestSender) sendReqToRegion(bo *Backoffer, rpcCtx *RPCContext,
 		defer cancel()
 	}
 
+	if rpcCtx.Store.storeType == kv.TiFlash {
+		failpoint.Inject("errorMockTiFlashServerTimeout", func(val failpoint.Value) {
+			if val.(bool) {
+				failpoint.Return(nil, false, errors.Trace(ErrTiFlashServerTimeout))
+			}
+		})
+	}
+
 	var connID uint64
 	if v := bo.ctx.Value(sessionctx.ConnID); v != nil {
 		connID = v.(uint64)
@@ -557,7 +565,7 @@ func (s *RegionRequestSender) onSendFail(bo *Backoffer, ctx *RPCContext, err err
 	// TODO: the number of retry time should be limited:since region may be unavailable
 	// when some unrecoverable disaster happened.
 	if ctx.Store != nil && ctx.Store.storeType == kv.TiFlash {
-		if bo.backoffTimes[boTiFlashRPC] >= RetryLimitOnTiFlash {
+		if bo.backoffTimes[boTiFlashRPC] >= retryLimitOnTiFlash {
 			return errors.Trace(ErrTiFlashServerTimeout)
 		}
 		err = bo.Backoff(boTiFlashRPC, errors.Errorf("send tiflash request error: %v, ctx: %v, try next peer later", err, ctx))
