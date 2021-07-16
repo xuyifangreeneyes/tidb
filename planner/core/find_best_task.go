@@ -603,6 +603,9 @@ func (ds *DataSource) tryHeuristics(candidates []*candidatePath) *candidatePath 
 			// TODO: do we need to handle TiFlash case?
 			continue
 		}
+		if len(cand.path.Ranges) == 0 {
+			return cand
+		}
 		if cand.path.OnlyPointQuery(ds.SCtx().GetSessionVars().StmtCtx) {
 			if cand.path.IsTablePath() || cand.path.Index.Unique {
 				if cand.isSingleScan {
@@ -635,7 +638,7 @@ func (ds *DataSource) tryHeuristics(candidates []*candidatePath) *candidatePath 
 			setsResult, comparable := compareColumnSet(singleScanIdx.accessCondsColSet, uniqueIdx.accessCondsColSet)
 			if comparable && setsResult == 1 {
 				if refinedBest == nil || len(singleScanIdx.path.Ranges) < len(refinedBest.path.Ranges) {
-					refinedBest = uniqueIdx
+					refinedBest = singleScanIdx
 				}
 			}
 		}
@@ -648,7 +651,7 @@ func (ds *DataSource) tryHeuristics(candidates []*candidatePath) *candidatePath 
 	// In the case, `refinedBest` is `idx_b_c_a_d` and `uniqueBest` is `a`. `idx_b_c_a_d` needs to access five points while `idx_a`
 	// only needs one point access and one table access.
 	// Hence we should compare `2 * len(uniqueBest.path.Ranges)` and `len(refinedBest.path.Ranges)`.
-	if refinedBest != nil && (uniqueBest == nil || len(refinedBest.path.Ranges) < 2 *len(uniqueBest.path.Ranges)) {
+	if refinedBest != nil && (uniqueBest == nil || len(refinedBest.path.Ranges) < 2*len(uniqueBest.path.Ranges)) {
 		return refinedBest
 	}
 	return uniqueBest
@@ -748,21 +751,22 @@ func (ds *DataSource) findBestTask(prop *property.PhysicalProperty, planCounter 
 	}
 
 	candidates := ds.getCandidatePaths(prop)
-	if len(candidates) > 1 {
-		hit := ds.tryHeuristics(candidates)
-		if hit != nil {
-			candidates = []*candidatePath{hit}
-			// TODO: this line makes some sql unable to be cached? maybe we can improve it
-			ds.ctx.GetSessionVars().StmtCtx.OptimDependOnMutableConst = true
-		} else {
+	hit := ds.tryHeuristics(candidates)
+	if hit != nil {
+		candidates = []*candidatePath{hit}
+		// tryHeuristics selects the path like PointGet or TableDual, which may depend on mutable parameters.
+		// TODO: have a finer check on whether the path selected by tryHeuristics depends on mutable parameters
+		ds.ctx.GetSessionVars().StmtCtx.OptimDependOnMutableConst = true
+	} else {
+		if len(candidates) > 1 {
 			candidates = ds.skylinePruning(candidates)
-			if ds.ctx.GetSessionVars().GetAllowPreferRangeScan() && len(candidates) > 1 {
-				// remove the table/index full scan path
-				for i, c := range candidates {
-					for _, ran := range c.path.Ranges {
-						if ran.IsFullRange() {
-							candidates = append(candidates[:i], candidates[i+1:]...)
-						}
+		}
+		if ds.ctx.GetSessionVars().GetAllowPreferRangeScan() && len(candidates) > 1 {
+			// remove the table/index full scan path
+			for i, c := range candidates {
+				for _, ran := range c.path.Ranges {
+					if ran.IsFullRange() {
+						candidates = append(candidates[:i], candidates[i+1:]...)
 					}
 				}
 			}
