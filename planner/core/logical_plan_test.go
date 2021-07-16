@@ -1646,16 +1646,47 @@ func byItemsToProperty(byItems []*util.ByItems) *property.PhysicalProperty {
 	return pp
 }
 
+func getPathName(path *candidatePath) string {
+	if path.path.IsTablePath() {
+		return "PRIMARY_KEY"
+	}
+	return path.path.Index.Name.O
+}
+
 func pathsName(paths []*candidatePath) string {
 	var names []string
 	for _, path := range paths {
-		if path.path.IsTablePath() {
-			names = append(names, "PRIMARY_KEY")
-		} else {
-			names = append(names, path.path.Index.Name.O)
-		}
+		names = append(names, getPathName(path))
 	}
 	return strings.Join(names, ",")
+}
+
+func getDataSourceAndProp(lp LogicalPlan) (*DataSource, *property.PhysicalProperty) {
+	var ds *DataSource
+	var byItems []*util.ByItems
+	for ds == nil {
+		switch v := lp.(type) {
+		case *DataSource:
+			ds = v
+		case *LogicalSort:
+			byItems = v.ByItems
+			lp = lp.Children()[0]
+		case *LogicalProjection:
+			newItems := make([]*util.ByItems, 0, len(byItems))
+			for _, col := range byItems {
+				idx := v.schema.ColumnIndex(col.Expr.(*expression.Column))
+				switch expr := v.Exprs[idx].(type) {
+				case *expression.Column:
+					newItems = append(newItems, &util.ByItems{Expr: expr, Desc: col.Desc})
+				}
+			}
+			byItems = newItems
+			lp = lp.Children()[0]
+		default:
+			lp = lp.Children()[0]
+		}
+	}
+	return ds, byItemsToProperty(byItems)
 }
 
 func (s *testPlanSuite) TestSkylinePruning(c *C) {
@@ -1736,32 +1767,67 @@ func (s *testPlanSuite) TestSkylinePruning(c *C) {
 		lp := p.(LogicalPlan)
 		_, err = lp.recursiveDeriveStats(nil)
 		c.Assert(err, IsNil, comment)
-		var ds *DataSource
-		var byItems []*util.ByItems
-		for ds == nil {
-			switch v := lp.(type) {
-			case *DataSource:
-				ds = v
-			case *LogicalSort:
-				byItems = v.ByItems
-				lp = lp.Children()[0]
-			case *LogicalProjection:
-				newItems := make([]*util.ByItems, 0, len(byItems))
-				for _, col := range byItems {
-					idx := v.schema.ColumnIndex(col.Expr.(*expression.Column))
-					switch expr := v.Exprs[idx].(type) {
-					case *expression.Column:
-						newItems = append(newItems, &util.ByItems{Expr: expr, Desc: col.Desc})
-					}
-				}
-				byItems = newItems
-				lp = lp.Children()[0]
-			default:
-				lp = lp.Children()[0]
-			}
-		}
-		paths := ds.skylinePruning(byItemsToProperty(byItems))
+		ds, prop := getDataSourceAndProp(lp)
+		candidates := ds.getCandidatePaths(prop)
+		paths := ds.skylinePruning(candidates)
 		c.Assert(pathsName(paths), Equals, tt.result, comment)
+	}
+}
+
+func (s *testPlanSuite) TestTryHeuristics(c *C) {
+	defer testleak.AfterTest(c)()
+	tests := []struct {
+		sql    string
+		result string
+	}{
+		{
+			sql:    "select * from t where a = 1",
+			result: "PRIMARY_KEY",
+		},
+		{
+			sql:    "select f, g from t where f = 2 and g = 3",
+			result: "f_g",
+		},
+		{
+			sql:    "select f, g from t where f = 2 and g in (3, 4, 5)",
+			result: "f_g",
+		},
+		{
+			sql:    "select * from t where c = 1 and (d = 2 or d = 3) and e in (4, 5)",
+			result: "c_d_e",
+		},
+		{
+			sql:    "select f, g from t where f = 2 and g > 3",
+			result: "f_g",
+		},
+	}
+	ctx := context.TODO()
+	for i, tt := range tests {
+		comment := Commentf("case:%v sql:%s", i, tt.sql)
+		stmt, err := s.ParseOneStmt(tt.sql, "", "")
+		c.Assert(err, IsNil, comment)
+		err = Preprocess(s.ctx, stmt, WithPreprocessorReturn(&PreprocessorReturn{InfoSchema: s.is}))
+		c.Assert(err, IsNil)
+		builder, _ := NewPlanBuilder(MockContext(), s.is, &hint.BlockHintProcessor{})
+		p, err := builder.Build(ctx, stmt)
+		if err != nil {
+			c.Assert(err.Error(), Equals, tt.result, comment)
+			continue
+		}
+		c.Assert(err, IsNil, comment)
+		p, err = logicalOptimize(ctx, builder.optFlag, p.(LogicalPlan))
+		c.Assert(err, IsNil, comment)
+		lp := p.(LogicalPlan)
+		_, err = lp.recursiveDeriveStats(nil)
+		c.Assert(err, IsNil, comment)
+		ds, prop := getDataSourceAndProp(lp)
+		candidates := ds.getCandidatePaths(prop)
+		hit := ds.tryHeuristics(candidates)
+		pathName := ""
+		if hit != nil {
+			pathName = getPathName(hit)
+		}
+		c.Assert(pathName, Equals, tt.result, comment)
 	}
 }
 

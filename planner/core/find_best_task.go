@@ -551,9 +551,7 @@ func (ds *DataSource) getIndexMergeCandidate(path *util.AccessPath) *candidatePa
 	return candidate
 }
 
-// skylinePruning prunes access paths according to different factors. An access path can be pruned only if
-// there exists a path that is not worse than it at all factors and there is at least one better factor.
-func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candidatePath {
+func (ds *DataSource) getCandidatePaths(prop *property.PhysicalProperty) []*candidatePath {
 	candidates := make([]*candidatePath, 0, 4)
 	for _, path := range ds.possibleAccessPaths {
 		if path.PartialIndexPaths != nil {
@@ -562,27 +560,24 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 		}
 		// if we already know the range of the scan is empty, just return a TableDual
 		if len(path.Ranges) == 0 {
+			ds.SCtx().GetSessionVars().StmtCtx.OptimDependOnMutableConst = true
 			return []*candidatePath{{path: path}}
 		}
 		if path.StoreType != kv.TiFlash && prop.IsFlashProp() {
 			continue
 		}
-		var currentCandidate *candidatePath
 		if path.IsTablePath() {
 			if path.StoreType == kv.TiFlash {
 				if path.IsTiFlashGlobalRead && prop.TaskTp == property.CopTiFlashGlobalReadTaskType {
-					currentCandidate = ds.getTableCandidate(path, prop)
+					candidates = append(candidates, ds.getTableCandidate(path, prop))
 				}
 				if !path.IsTiFlashGlobalRead && prop.TaskTp != property.CopTiFlashGlobalReadTaskType {
-					currentCandidate = ds.getTableCandidate(path, prop)
+					candidates = append(candidates, ds.getTableCandidate(path, prop))
 				}
 			} else {
 				if !path.IsTiFlashGlobalRead && !prop.IsFlashProp() {
-					currentCandidate = ds.getTableCandidate(path, prop)
+					candidates = append(candidates, ds.getTableCandidate(path, prop))
 				}
-			}
-			if currentCandidate == nil {
-				continue
 			}
 		} else {
 			coveredByIdx := ds.isCoveringIndex(ds.schema.Columns, path.FullIdxCols, path.FullIdxColLens, ds.tableInfo)
@@ -592,43 +587,101 @@ func (ds *DataSource) skylinePruning(prop *property.PhysicalProperty) []*candida
 				// 2. We have a non-empty prop to match.
 				// 3. This index is forced to choose.
 				// 4. The needed columns are all covered by index columns(and handleCol).
-				currentCandidate = ds.getIndexCandidate(path, prop, coveredByIdx)
-			} else {
-				continue
+				candidates = append(candidates, ds.getIndexCandidate(path, prop, coveredByIdx))
 			}
-		}
-		pruned := false
-		for i := len(candidates) - 1; i >= 0; i-- {
-			if candidates[i].path.StoreType == kv.TiFlash {
-				continue
-			}
-			result := compareCandidates(candidates[i], currentCandidate)
-			if result == 1 {
-				pruned = true
-				// We can break here because the current candidate cannot prune others anymore.
-				break
-			} else if result == -1 {
-				candidates = append(candidates[:i], candidates[i+1:]...)
-			}
-		}
-		if !pruned {
-			candidates = append(candidates, currentCandidate)
 		}
 	}
+	return candidates
+}
 
-	if ds.ctx.GetSessionVars().GetAllowPreferRangeScan() && len(candidates) > 1 {
-		// remove the table/index full scan path
-		for i, c := range candidates {
-			for _, ran := range c.path.Ranges {
-				if ran.IsFullRange() {
-					candidates = append(candidates[:i], candidates[i+1:]...)
-					return candidates
+// tryHeuristics uses some heuristic rules to select access path. If no path matches any rule, return nil.
+func (ds *DataSource) tryHeuristics(candidates []*candidatePath) *candidatePath {
+	uniqueIndicesWithDoubleScan := make([]*candidatePath, 0, len(candidates))
+	singleScanIndices := make([]*candidatePath, 0, len(candidates))
+	for _, cand := range candidates {
+		if cand.path.PartialIndexPaths != nil || cand.path.StoreType == kv.TiFlash {
+			// TODO: do we need to handle TiFlash case?
+			continue
+		}
+		if cand.path.OnlyPointQuery(ds.SCtx().GetSessionVars().StmtCtx) {
+			if cand.path.IsTablePath() || cand.path.Index.Unique {
+				if cand.isSingleScan {
+					// TODO: what if multiple candidates satisfy the above conditions?
+					return cand
+				}
+				uniqueIndicesWithDoubleScan = append(uniqueIndicesWithDoubleScan, cand)
+			}
+		} else if cand.isSingleScan {
+			singleScanIndices = append(singleScanIndices, cand)
+		}
+	}
+	// Find the unique index with the minimal number of ranges as `uniqueBest`.
+	var uniqueBest, refinedBest *candidatePath
+	for _, uniqueIdx := range uniqueIndicesWithDoubleScan {
+		if uniqueBest == nil || len(uniqueIdx.path.Ranges) < len(uniqueBest.path.Ranges) {
+			uniqueBest = uniqueIdx
+		}
+	}
+	// `uniqueBest` may not always be the best.
+	// ```
+	// create table t(a int, b int, c int, unique index idx_b(b), unique index idx_b_c(b, c));
+	// select b, c from t where b = 5 and c > 10;
+	// ```
+	// In the case, `uniqueBest` is `idx_b`. However, `idx_b_c` is better than `idx_b_c`.
+	// Hence, for each index in `singleScanIndices`, we check whether it is better than some index in `uniqueIndicesWithDoubleScan`.
+	// If yes, the index is a refined one. We find the refined index with the minimal number of ranges as `refineBest`.
+	for _, singleScanIdx := range singleScanIndices {
+		for _, uniqueIdx := range uniqueIndicesWithDoubleScan {
+			setsResult, comparable := compareColumnSet(singleScanIdx.accessCondsColSet, uniqueIdx.accessCondsColSet)
+			if comparable && setsResult == 1 {
+				if refinedBest == nil || len(singleScanIdx.path.Ranges) < len(refinedBest.path.Ranges) {
+					refinedBest = uniqueIdx
 				}
 			}
 		}
 	}
+	// `refineBest` may not always be better than `uniqueBest`.
+	// ```
+	// create table t(int a, int b, int c, int d, unique index idx_a(a), unique index idx_b_c(b, c), unique index idx_b_c_a_d(b, c, a, d));
+	// select a, b, c from t where a = 1 and b = 2 and c in (1, 2, 3, 4, 5);
+	// ```
+	// In the case, `refinedBest` is `idx_b_c_a_d` and `uniqueBest` is `a`. `idx_b_c_a_d` needs to access five points while `idx_a`
+	// only needs one point access and one table access.
+	// Hence we should compare `2 * len(uniqueBest.path.Ranges)` and `len(refinedBest.path.Ranges)`.
+	if refinedBest != nil && (uniqueBest == nil || len(refinedBest.path.Ranges) < 2 *len(uniqueBest.path.Ranges)) {
+		return refinedBest
+	}
+	return uniqueBest
+}
 
-	return candidates
+// skylinePruning prunes access paths according to different factors. An access path can be pruned only if
+// there exists a path that is not worse than it at all factors and there is at least one better factor.
+func (ds *DataSource) skylinePruning(candidates []*candidatePath) []*candidatePath {
+	pruned := make([]bool, len(candidates))
+	newCandidates := make([]*candidatePath, 0, len(candidates))
+	for i, cand := range candidates {
+		// TODO: do we need to compare between TiFlash candidates?
+		if cand.path.PartialIndexPaths != nil || cand.path.StoreType == kv.TiFlash || pruned[i] {
+			continue
+		}
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[j].path.PartialIndexPaths != nil || candidates[j].path.StoreType == kv.TiFlash || pruned[j] {
+				continue
+			}
+			result := compareCandidates(cand, candidates[j])
+			if result == 1 {
+				pruned[j] = true
+			} else if result == -1 {
+				pruned[i] = true
+			}
+		}
+	}
+	for i, p := range pruned {
+		if !p {
+			newCandidates = append(newCandidates, candidates[i])
+		}
+	}
+	return newCandidates
 }
 
 // findBestTask implements the PhysicalPlan interface.
@@ -694,9 +747,29 @@ func (ds *DataSource) findBestTask(prop *property.PhysicalProperty, planCounter 
 		return t, 1, err
 	}
 
-	t = invalidTask
-	candidates := ds.skylinePruning(prop)
+	candidates := ds.getCandidatePaths(prop)
+	if len(candidates) > 1 {
+		hit := ds.tryHeuristics(candidates)
+		if hit != nil {
+			candidates = []*candidatePath{hit}
+			// TODO: this line makes some sql unable to be cached? maybe we can improve it
+			ds.ctx.GetSessionVars().StmtCtx.OptimDependOnMutableConst = true
+		} else {
+			candidates = ds.skylinePruning(candidates)
+			if ds.ctx.GetSessionVars().GetAllowPreferRangeScan() && len(candidates) > 1 {
+				// remove the table/index full scan path
+				for i, c := range candidates {
+					for _, ran := range c.path.Ranges {
+						if ran.IsFullRange() {
+							candidates = append(candidates[:i], candidates[i+1:]...)
+						}
+					}
+				}
+			}
+		}
+	}
 
+	t = invalidTask
 	cntPlan = 0
 	for _, candidate := range candidates {
 		path := candidate.path
